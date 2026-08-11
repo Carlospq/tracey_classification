@@ -1,0 +1,168 @@
+### README
+# This script predicts the groups that a sequences belongs to using regression models
+#
+#
+# INPUT: string
+# 	- either a single protein sequence or
+# 	- path to a fasta file with multiple protein sequences
+
+import os, sys
+import subprocess, tempfile
+import pickle
+import numpy as np
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+from scripts.motifNames import *
+from scripts.pipeline_utils import searchHMMs, nestedDictValues
+from scripts.pipeline_utils import retriveEvaluesLog as retriveEvalues
+
+#### Function to predict domain and subdomain of a given sequence given the evalues obtained with hmmsearch
+def domainPredict(evals, tree, probCutOff = 60, domainfamily="SNARE"):
+
+	def predictGroups(evals, tree, groupName="", probCutOff = probCutOff, results=None, iteration=None, domainfamily="SNARE"):
+
+		def probsToDict(model, evals):
+			groups = model.classes_
+			probs = model.predict_proba([evals])[0]
+			probsDict = {}
+			for i in range(len(groups)):
+				probsDict[groups[i]] = probs[i] * 100
+			return probsDict
+
+		def nBest(model, evals, n):
+			probsDict = probsToDict(model, evals)
+			nProb = sorted(model.predict_proba([evals])[0])[-n] * 100
+			nGroup = [x for x in probsDict if probsDict[x] == nProb][0]
+			return [nGroup, nProb]
+
+		labels = ["group", "subgroup", "subgroup_rank0", "subgroup_rank1", "subgroup_rank2"]
+		if not results:
+			results = {"domain": domainfamily}
+			iteration = 0
+
+		if iteration == 0:
+			modelName = "regressionModel/lm_%s_mainMotifs.sav"%(domainfamily)
+		elif iteration == 1:
+			modelName = "regressionModel/lm_%s_%s.sav"%(domainfamily, results["group"])
+		else:
+			modelName = "regressionModel/lm_%s_%s_rank%s.sav" % (domainfamily, results["subgroup"], str(iteration - 2))
+
+		model = pickle.load(open(modelName, 'rb'))
+		pred_group, pred_group_prob = nBest(model, evals, 1)
+		results[labels[iteration]] = pred_group
+		results[labels[iteration]+"_prob"] = pred_group_prob
+		if pred_group_prob < probCutOff:
+			sug_pred_group, sug_pred_group_prob = nBest(model, evals, 2)
+			results["sug_" + labels[iteration]] = sug_pred_group
+			results["sug_" + labels[iteration] + "_prob"] = sug_pred_group_prob
+
+		if tree[pred_group]:
+			predictGroups(evals, tree[pred_group], pred_group, probCutOff=probCutOff, results=results, iteration=iteration+1, domainfamily=domainfamily)
+
+		return results
+
+	# Prediction
+	results = predictGroups(evals, tree)
+	return results
+
+
+#### Formatting for printing results
+def formatPrediction(results):
+
+	def color(eval):
+		if eval >= 90:
+			col = '\033[92m' # green
+		elif eval >= 70:
+			col = '\033[32m' # okGreen
+		elif eval >= 50:
+			col = '\033[33m' # yellow
+		elif eval >= 30:
+			col = '\033[35m' # magenta
+		elif eval >= 10: 
+			col = '\033[31m' # warning
+		else:
+			col = '\033[30m' # black
+		ENDC = '\033[0m'
+		return "%s%.2f%s" % (col, eval, ENDC)
+	    
+	printOut =  '## Domain prediction || Values between parenthesis are predicted probabilities for each model; If probability is below treshold an alternative prediction is also given\n\n'
+	printOut += '# Prediction\n\tDomain: %s \n\t' % (results['domain']) #, color(results['domain_prob']))
+	
+	if "sug_group" in results and results["sug_group"]:
+		printOut += 'Group: %s (%s) [Suggested: %s (%s)]\n\tSubgroup: %s (%s)\n\t' % (results['group'], color(results['group_prob']), results['sug_group'], color(results['sug_group_prob']), results['subgroup'], color(results['subgroup_prob']))
+	else:
+		printOut += 'Group: %s (%s)\n\tSubgroup: %s (%s)\n\t' % (results['group'], color(results['group_prob']), results['subgroup'], color(results['subgroup_prob']))
+		for x in results:
+			if "rank" in x and not "prob" in x:
+				printOut += '%s: %s (%s)\n\t' % (x, results[x], color(results[x+"_prob"]))
+
+	if "sug_subgroup" in results and results["sug_subgroup"]:
+		printOut += ' [Suggested: %s (%s)]\n\n' % (results['sug_subgroup'], color(results['sug_subgroup_prob']))
+	else:
+		printOut += '\n\n'
+
+	return printOut
+
+	
+#### Prediction and formatting of results combined
+def snareMotifPrediction(evals, tree, probCutOff = 60, domainfamily="SNARE"):
+	print(formatPrediction(domainPredict(evals, tree, probCutOff = probCutOff, domainfamily=domainfamily)))
+
+
+#### Prediction from fasta file
+def predictFromFasta(fastaFile, all_motifs, tree, hmmDB="hmms/SNAREDb", domtblout=None):
+
+	if not domtblout:
+		domtblout = fastaFile + ".domtblout"
+
+	searchHMMs(fastaFile, hmmDB, domtblout)
+	evals = retriveEvalues(domtblout, all_motifs)
+	for seqId in evals:
+		seqEvals = [evals[seqId][x] for x in evals[seqId]]
+		snareMotifPrediction(seqEvals, tree, probCutOff = 60, domainfamily="SNARE")
+
+
+#### Write sequence into fasta file
+def seqToFasta(seq, fastaFile, header="seq"):
+	with open(fastaFile, 'w') as f:
+		f.write(">%s\n%s\n" % (header, seq))
+
+
+#### Prediction from a single sequence string
+def predictFromSeq(seq, all_motifs, tree, hmmDB="hmms/SNAREDb", header="seq"):
+	if not os.path.exists("tmp"):
+		os.makedirs("tmp")
+	new_file, fastaFile = tempfile.mkstemp(dir="tmp", suffix=".fasta")
+	os.close(new_file)
+	seqToFasta(seq, fastaFile, header=header)
+	try:
+		predictFromFasta(fastaFile, all_motifs, tree, hmmDB=hmmDB)
+	finally:
+		os.remove(fastaFile)
+
+
+# Test
+if __name__ == '__main__':
+
+	### Get all domains in lists
+	domainSNARE = nestedDictValues(SNARETree)[0]
+	groupSNARE = nestedDictValues(SNARETree)[1]
+	subgroupSNARE = [hmm for rank in nestedDictValues(SNARETree) for hmm in nestedDictValues(SNARETree)[rank] if rank >= 2]
+	allSNARE = domainSNARE + groupSNARE + subgroupSNARE
+
+	fastaFile = "test.fasta"
+	hmmDB = "hmms/SNAREDb.hmm"
+	domain = "SNARE"
+
+	if not os.path.exists("tmp"):
+		os.makedirs("tmp")
+
+	new_file, domtblout = tempfile.mkstemp(dir="tmp")
+	searchHMMs(fastaFile, hmmDB, domtblout)
+	evals = retriveEvalues(domtblout, allSNARE)
+	os.remove(domtblout)
+
+	for seqId in evals:
+		seqEvals = [evals[seqId][x] for x in evals[seqId]]
+		results = domainPredict(seqEvals, SNARETree, probCutOff = 60, domainfamily=domain)
+		print(formatPrediction(results))
