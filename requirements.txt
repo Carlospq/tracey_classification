@@ -1,0 +1,11 @@
+# Python dependencies for the SNARE/Habc classification pipeline.
+# No lockfile/CI exists to pin a known-working version set, so these are
+# unpinned; install with `pip install -r requirements.txt`.
+biopython
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+seqlogo
+prody
