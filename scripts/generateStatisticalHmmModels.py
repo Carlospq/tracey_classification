@@ -88,7 +88,6 @@ for alignmentFile in os.listdir(alignmentsPath):
 		print("Trimming alignment %s" % (alignmentFile))
 		trimAlignment(alignmentsPath + alignmentFile, trimmedAln)
 
-
 ### Build Trees  (recommended: run on an HPC cluster) from these alignments and use this information to generate subgroups by selecting initial sequences for each group
 print("# Building trees")
 for trimmedAln in os.listdir(alignmentsPath):
@@ -100,17 +99,25 @@ for trimmedAln in os.listdir(alignmentsPath):
 		process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 		output, error = process.communicate()
 
-### Plot trees PDF - For some reason running the command from python may not work. Run in Rstudio if necessary
+### Plot trees PDF - For some reason running the command from python may not work. Run directly in Rstudio if necessary
 print("# Plotting trees")
 cmd = "Rscript scripts/PlotTree.R"
 process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 output, error = process.communicate()
 
 
-### Initial sequences set selection for subgroups (initialSetSelection/setSelection.Py)
-# Manually select the initial set of sequences for each subgroup and run setSelection.py script to obtain the final initialSet of sequences for each subgroup
+### Initial sequence set selection for subgroups and main domains (initialSetSelection/setSelection.py)
+# Seed sequence lists for each subgroup (initialSetSelection/initialSets/*.initialSet.txt) are still
+# curated manually from the trees above; this just runs the selection/refinement itself per fasta.
 # new fastas, alignments and hmms are generated in the iterations folder
-# copy this files to the corresponding folders
+print("# Selecting initial sequence sets")
+from initialSetSelection.setSelection import runInitialSetSelection
+for fastaFile in os.listdir(fastasPath):
+	if not fastaFile.endswith(".fasta"): continue
+	prefix = fastaFile.replace(".fasta", "")
+	if prefix not in domainSNARE and prefix not in groupSNARE: continue
+	print("Selecting initial set for %s" % (prefix))
+	runInitialSetSelection(prefix)
 
 ### Copy fastas/alignments/hmms from iterations to the corresponding folders
 print("# Copying files")
@@ -134,15 +141,48 @@ for fastaFile in os.listdir(initialSetSelectionPath + "iterations/"):
 
 
 ### Generate HMMs for main groups (Qa, Qb, ...) and generate HMM db concatenating all HMMs
+# No domain-wide fasta is ever supplied directly (a domain-wide tree/alignment is too costly to
+# build locally, hence the group/subgroup split above), so this redoes clean/align/trim/hmmbuild
+# just for the main domains -- skipping tree-building -- using a fasta merged from every
+# fastas/{domain}.*.fasta already on disk (group- and subgroup-level, including the ones the
+# "Copying files" step above just produced).
+# Some domains were exported under a legacy raw filename before the group/subgroup naming
+# convention was settled (SNAP's combined domain fasta is fastas/SNAPbc.fasta, not fastas/SNAP.fasta).
+domainFastaAliases = {"SNAP": "SNAPbc"}
+
 print("# Generating main HMMs")
-for trimmedAln in [x for x  in os.listdir(alignmentsPath) if x.startswith(x.split(".")[0]+".trimmed") and x.split(".")[0] in domainSNARE]:
-	hmmFile = hmmsPath + trimmedAln.replace(".trimmed.aln", ".hmm")
-	hmmName = hmmFile.split("/")[-1].replace(".hmm", "")
-	if not os.path.isfile(hmmFile):
-		print("Generating HMM for %s" % (trimmedAln))
-		cmd = "hmmbuild -n %s %s %s" % (trimmedAln.replace(".trimmed.aln", ""), hmmFile, alignmentsPath + trimmedAln)
-		process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-		output, error = process.communicate()
+for domain in domainSNARE:
+	hmmFile = hmmsPath + domain + ".hmm"
+	if os.path.isfile(hmmFile): continue
+
+	domainFastaFile = fastasPath + domain + ".fasta"
+	if not os.path.isfile(domainFastaFile):
+		domainSeqs = {}
+		alias = domainFastaAliases.get(domain)
+		for fastaFile in os.listdir(fastasPath):
+			if not fastaFile.endswith(".fasta"): continue
+			name = fastaFile[:-len(".fasta")]
+			if not (name.startswith(domain + ".") or name == alias): continue
+			domainSeqs.update(readFasta(fastasPath + fastaFile))
+		if not domainSeqs:
+			print("No fastas found for %s, skipping" % (domain))
+			continue
+		print("Merging fastas for %s (%d sequences)" % (domain, len(domainSeqs)))
+		writeFasta(domainSeqs, domainFastaFile)
+
+	alignment = alignmentsPath + domain + ".aln"
+	trimmedAln = alignmentsPath + domain + ".trimmed.aln"
+	if not os.path.isfile(alignment):
+		print("Aligning %s" % (domainFastaFile))
+		alignFasta(domainFastaFile, alignment)
+	if not os.path.isfile(trimmedAln):
+		print("Trimming alignment for %s" % (domain))
+		trimAlignment(alignment, trimmedAln)
+
+	print("Generating HMM for %s" % (domain))
+	cmd = "hmmbuild -n %s %s %s" % (domain, hmmFile, trimmedAln)
+	process = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+	output, error = process.communicate()
 
 print("# Generating HMM db")
 dbName = "SNAREDb"
